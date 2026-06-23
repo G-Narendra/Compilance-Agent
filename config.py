@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # nvidia nims api config
     nvidia_api_key: str = ""
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
-    compliance_model: str = "microsoft/phi-3-mini-128k-instruct"
+    compliance_model: str = "meta/llama-3.1-8b-instruct"
     use_mock_llm: bool = False
 
     # vector db (qdrant in-memory)
