@@ -22,6 +22,9 @@ def run_async(coro):
     asyncio.set_event_loop(loop)
     return loop.run_until_complete(coro)
 
+if "audit_cache" not in st.session_state:
+    st.session_state.audit_cache = {}
+
 st.markdown('<div class="status-badge status-active">🟢 RAG Auditor Engine Active</div>', unsafe_allow_html=True)
 st.markdown('<h1 class="main-header">Compliance Agent</h1>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Zero-hallucination compliance audits with exact citations using local RAG.</p>', unsafe_allow_html=True)
@@ -295,7 +298,13 @@ if st.session_state.rulebook_id and st.session_state.target_docs:
             async def run_all():
                 tasks = []
                 for idx, doc in enumerate(st.session_state.target_docs):
-                    tasks.append(map_reduce_audit(doc, st.session_state.rulebook_id, status_containers[idx], global_sem))
+                    cache_key = f"{st.session_state.rulebook_id}_{doc['hash']}"
+                    if cache_key in st.session_state.audit_cache:
+                        st.write(f"ℹ️ Using cached audit report for '{doc['filename']}'.")
+                        # return a future that resolves to the cached report immediately
+                        tasks.append(asyncio.sleep(0, result=st.session_state.audit_cache[cache_key]))
+                    else:
+                        tasks.append(map_reduce_audit(doc, st.session_state.rulebook_id, status_containers[idx], global_sem))
                 return await asyncio.gather(*tasks)
                 
             all_reports = run_async(run_all())
@@ -303,6 +312,8 @@ if st.session_state.rulebook_id and st.session_state.target_docs:
             for doc, report in zip(st.session_state.target_docs, all_reports):
                 if report:
                     st.session_state.reports[doc["filename"]] = report
+                    cache_key = f"{st.session_state.rulebook_id}_{doc['hash']}"
+                    st.session_state.audit_cache[cache_key] = report
                 else:
                     st.error(f"Failed to generate report for {doc['filename']}")
             
