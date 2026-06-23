@@ -7,6 +7,8 @@
 [![Vector Database Qdrant](https://img.shields.io/badge/vector_db-Qdrant-darkviolet.svg)](https://qdrant.tech/)
 [![License MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+🔴 **Live Demo URL:** [https://compilance-agent.streamlit.app/](https://compilance-agent.streamlit.app/)
+
 ---
 
 ## 🎯 Problem Statement
@@ -51,6 +53,9 @@ graph TD
 
 - **Progressive UI Journey**: Uses Streamlit forms and session states to enforce a clean step-by-step flow (Master Rulebook ingestion ➡️ Target Document upload ➡️ Parallel Audit execution).
 - **Parallel Map-Reduce Auditing**: Target documents are split, mapped to async threads running hybrid retrieval, evaluated against the rulebook, and then dynamically merged and deduplicated.
+- **State-Aware Audit Caching**: Utilizes advanced SHA-256 document hashing and session state to cache finalized audit reports. Re-running unchanged documents guarantees **zero-latency** execution and eliminates LLM non-determinism.
+- **Hardened Error Resilience**: The Map-Reduce orchestrator features strict exception handling. If the LLM API fails or times out, the system safely falls back to an `Error` state (0/100) instead of yielding a false-positive compliance score.
+- **Offline / Mock Testing Mode**: Toggle `USE_MOCK_LLM=true` in your `.env` to instantly bypass network calls and simulate API responses, allowing rapid UI/UX testing without consuming API credits.
 - **Developer Traceability (SQLite)**: Silently logs token usage, latencies, exceptions, and raw LLM outputs to a local SQLite database (`telemetry.db`) with an interactive debugging panel in the UI.
 - **Premium Layout PDF Generator**: Generates clean, well-aligned PDF reports with colored left accent bars corresponding to finding severity (Critical, High, Medium, Info) and page-break sentinels to prevent orphaned headers.
 
@@ -99,7 +104,11 @@ cp .env.example .env
 ```
 Ensure you provide your **NVIDIA API Key** in `.env`:
 ```env
+# NVIDIA NIMs API key
 NVIDIA_API_KEY=nvapi-your_nvidia_key_here
+
+# (Optional) Set to true to test the UI flow instantly without consuming an API key
+USE_MOCK_LLM=false
 ```
 
 ### 3. Launch Streamlit Application
