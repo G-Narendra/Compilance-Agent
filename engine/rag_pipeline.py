@@ -104,6 +104,15 @@ def retrieve_relevant_rules(rulebook_id: str, query: str, top_k: int = 5) -> lis
     # hybrid search via reciprocal rank fusion (rrf)
     collection_name = _get_collection_name(rulebook_id)
     
+    # Auto-restore rulebook if missing from in-memory DB or index but cached in session state
+    if not get_qdrant_client().collection_exists(collection_name) or rulebook_id not in _bm25_indexes:
+        if "parsed_rulebook" in st.session_state and st.session_state.parsed_rulebook:
+            log.warning("Rulebook collection or index missing from memory. Attempting auto-restore...", rulebook_id=rulebook_id)
+            try:
+                ingest_rulebook(rulebook_id, st.session_state.parsed_rulebook)
+            except Exception as e:
+                log.error("Failed to auto-restore rulebook collection", rulebook_id=rulebook_id, error=str(e))
+                
     if not get_qdrant_client().collection_exists(collection_name) or rulebook_id not in _bm25_indexes:
         log.error("tried to query missing rulebook collection", rulebook_id=rulebook_id)
         return []

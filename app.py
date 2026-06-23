@@ -60,39 +60,78 @@ if submitted:
     if not rulebook_file or not target_files:
         st.error("Please upload BOTH a master rulebook and at least one target document.")
     else:
+        import hashlib
         with st.spinner("Parsing and vectorizing documents..."):
             # 1. process rulebook
             rule_content = rulebook_file.read()
-            parsed_rulebook = parse_uploaded_content(rule_content, rulebook_file.name)
+            rulebook_file.seek(0)
             
-            if parsed_rulebook.get("errors"):
-                st.error(f"Error parsing rulebook: {parsed_rulebook['errors']}")
+            rulebook_hash = hashlib.sha256(rule_content).hexdigest()
+            rulebook_cached = (
+                st.session_state.get("rulebook_file_hash") == rulebook_hash
+                and st.session_state.get("rulebook_id") is not None
+                and st.session_state.get("parsed_rulebook") is not None
+            )
+            
+            if not rulebook_cached:
+                st.write("🔄 Parsing and vectorizing new master rulebook...")
+                parsed_rulebook = parse_uploaded_content(rule_content, rulebook_file.name)
+                
+                if parsed_rulebook.get("errors"):
+                    st.error(f"Error parsing rulebook: {parsed_rulebook['errors']}")
+                    st.stop()
+                else:
+                    raw_rule_text = "\n".join([p["text"] for p in parsed_rulebook["pages"]])
+                    doc_id = hash_text(raw_rule_text)
+                    chunks = ingest_rulebook(doc_id, parsed_rulebook)
+                    
+                    st.session_state.rulebook_id = doc_id
+                    st.session_state.rulebook_text = raw_rule_text
+                    st.session_state.parsed_rulebook = parsed_rulebook
+                    st.session_state.rulebook_file_hash = rulebook_hash
+                    st.write(f"✅ Rulebook vectorized ({chunks} chunks).")
             else:
-                raw_rule_text = "\n".join([p["text"] for p in parsed_rulebook["pages"]])
-                doc_id = hash_text(raw_rule_text)
+                st.write("ℹ️ Master rulebook has not changed. Using cached vectors.")
+                doc_id = st.session_state.rulebook_id
+                # Warm up / restore index if needed
+                retrieve_relevant_rules(doc_id, "")
                 
-                # ingest into qdrant & bm25
-                chunks = ingest_rulebook(doc_id, parsed_rulebook)
+            # 2. process targets
+            new_target_docs = []
+            target_hashes = {}
+            for t_file in target_files:
+                t_content = t_file.read()
+                t_file.seek(0)
+                t_hash = hashlib.sha256(t_content).hexdigest()
+                target_hashes[t_file.name] = t_hash
                 
-                st.session_state.rulebook_id = doc_id
-                st.session_state.rulebook_text = raw_rule_text
+                existing_doc = next(
+                    (d for d in st.session_state.get("target_docs", []) 
+                     if d["filename"] == t_file.name and d.get("hash") == t_hash),
+                    None
+                )
                 
-                # 2. process targets
-                st.session_state.target_docs = []
-                for t_file in target_files:
-                    t_content = t_file.read()
+                if existing_doc:
+                    st.write(f"ℹ️ Target file '{t_file.name}' has not changed. Using cached parsed text.")
+                    new_target_docs.append(existing_doc)
+                else:
+                    st.write(f"🔄 Parsing target file '{t_file.name}'...")
                     parsed_target = parse_uploaded_content(t_content, t_file.name)
                     if parsed_target.get("errors"):
                         st.error(f"Error parsing target {t_file.name}: {parsed_target['errors']}")
                     else:
                         raw_target_text = "\n".join([p["text"] for p in parsed_target["pages"]])
-                        st.session_state.target_docs.append({
+                        new_target_docs.append({
                             "filename": t_file.name,
-                            "text": raw_target_text
+                            "text": raw_target_text,
+                            "hash": t_hash
                         })
-                
-                if st.session_state.target_docs:
-                    st.success(f"✅ Setup complete! Rulebook vectorized ({chunks} chunks) and {len(st.session_state.target_docs)} target(s) loaded.")
+            
+            st.session_state.target_docs = new_target_docs
+            st.session_state.target_hashes = target_hashes
+            
+            if st.session_state.target_docs:
+                st.success(f"✅ Setup complete! {len(st.session_state.target_docs)} target(s) ready for audit.")
 
 st.divider()
 
@@ -110,30 +149,54 @@ async def map_reduce_audit(target_doc: dict, rulebook_id: str, status_container,
     async def process_chunk(idx, chunk):
         async with global_sem:
             progress_text.markdown(f"**🔄 {filename}**: Auditing section {idx+1} of {len(chunks)}...")
-            context = retrieve_relevant_rules(rulebook_id, chunk, top_k=5)
-            if not context or not chunk.strip():
-                return None
-            sys_prompt, user_prompt = build_rag_prompt(context, chunk)
-            result = await llm_service.analyze_with_json(sys_prompt, user_prompt)
-            
-            parsed = result.get("parsed")
-            status = "success"
-            if result.get("error_message"):
-                status = "error"
-            elif not parsed:
-                status = "empty_parse"
+            try:
+                if not chunk.strip():
+                    return {"parsed": None, "error": "Empty section content."}
                 
-            log_telemetry(
-                trace_id=trace_id,
-                target_document=filename,
-                chunk_index=idx,
-                tokens_used=result.get("tokens_used", 0),
-                latency_ms=result.get("latency_ms", 0.0),
-                status=status,
-                error_message=result.get("error_message", ""),
-                raw_llm_response=result.get("raw_response", "")
-            )
-            return parsed
+                context = retrieve_relevant_rules(rulebook_id, chunk, top_k=5)
+                if not context:
+                    return {"parsed": None, "error": "No relevant rules retrieved (empty context). Check vector DB state."}
+                
+                sys_prompt, user_prompt = build_rag_prompt(context, chunk)
+                result = await llm_service.analyze_with_json(sys_prompt, user_prompt)
+                
+                parsed = result.get("parsed")
+                status = "success"
+                error_msg = result.get("error_message", "")
+                
+                if error_msg:
+                    status = "error"
+                elif not parsed:
+                    status = "empty_parse"
+                    error_msg = "Failed to parse JSON response from compliance model. Check raw LLM output."
+                    
+                log_telemetry(
+                    trace_id=trace_id,
+                    target_document=filename,
+                    chunk_index=idx,
+                    tokens_used=result.get("tokens_used", 0),
+                    latency_ms=result.get("latency_ms", 0.0),
+                    status=status,
+                    error_message=error_msg,
+                    raw_llm_response=result.get("raw_response", "")
+                )
+                
+                if error_msg:
+                    return {"parsed": None, "error": error_msg}
+                return {"parsed": parsed, "error": None}
+            except Exception as e:
+                err_str = f"Execution exception: {str(e)}"
+                log_telemetry(
+                    trace_id=trace_id,
+                    target_document=filename,
+                    chunk_index=idx,
+                    tokens_used=0,
+                    latency_ms=0.0,
+                    status="error",
+                    error_message=err_str,
+                    raw_llm_response=""
+                )
+                return {"parsed": None, "error": err_str}
             
     tasks = [process_chunk(i, chunk) for i, chunk in enumerate(chunks)]
     results = await asyncio.gather(*tasks)
@@ -146,24 +209,37 @@ async def map_reduce_audit(target_doc: dict, rulebook_id: str, status_container,
         "score": 0,
         "status": "pass",
         "summary": f"Aggregated audit completed across {len(chunks)} document sections.",
-        "findings": []
+        "findings": [],
+        "errors": []
     }
     
     valid_scores = []
     raw_findings = []
+    chunk_errors = []
     for r in results:
-        if not r: continue
-        
-        if r.get("score") is not None:
-            valid_scores.append(r.get("score"))
+        if not r:
+            chunk_errors.append("Unspecified processing error in chunk.")
+            continue
             
-        r_status = r.get("status", "pass").lower()
+        if r.get("error"):
+            chunk_errors.append(r.get("error"))
+            continue
+            
+        parsed = r.get("parsed")
+        if not parsed:
+            chunk_errors.append("Parsed result was empty.")
+            continue
+        
+        if parsed.get("score") is not None:
+            valid_scores.append(parsed.get("score"))
+            
+        r_status = parsed.get("status", "pass").lower()
         if r_status == "fail":
             final_report["status"] = "fail"
         elif r_status == "partial" and final_report["status"] != "fail":
             final_report["status"] = "partial"
             
-        raw_findings.extend(r.get("findings", []))
+        raw_findings.extend(parsed.get("findings", []))
         
     unique_findings = {}
     for finding in raw_findings:
@@ -184,11 +260,18 @@ async def map_reduce_audit(target_doc: dict, rulebook_id: str, status_container,
                 unique_findings[dedup_key] = finding
                 
     final_report["findings"] = list(unique_findings.values())
+    final_report["errors"] = chunk_errors
         
     if valid_scores:
         final_report["score"] = sum(valid_scores) // len(valid_scores)
     else:
-        final_report["score"] = 100
+        final_report["score"] = 0
+        
+    if chunk_errors:
+        if not valid_scores:
+            final_report["status"] = "error"
+        else:
+            final_report["status"] = "partial_error"
         
     return final_report
 
@@ -240,12 +323,25 @@ if st.session_state.reports:
             with m1:
                 st.markdown(f'<div class="metric-card"><h3>Score</h3><h1 style="color: {"#4ADE80" if report["score"] > 80 else "#F87171"};">{report["score"]}/100</h1></div>', unsafe_allow_html=True)
             with m2:
-                status_color = "#4ADE80" if report["status"] == "pass" else "#FACC15" if report["status"] == "partial" else "#F87171"
+                status_colors = {
+                    "pass": "#4ADE80",
+                    "partial": "#FACC15",
+                    "fail": "#F87171",
+                    "error": "#EF4444",
+                    "partial_error": "#F97316"
+                }
+                status_color = status_colors.get(report.get("status", "pass").lower(), "#94A3B8")
                 st.markdown(f'<div class="metric-card"><h3>Status</h3><h1 style="color: {status_color}; text-transform: uppercase;">{report["status"]}</h1></div>', unsafe_allow_html=True)
             with m3:
                 st.markdown(f'<div class="metric-card"><h3>Executive Summary</h3><p>{report["summary"]}</p></div>', unsafe_allow_html=True)
                 
             st.markdown("### Detailed Findings")
+            
+            # Show any chunk processing errors
+            if report.get("errors"):
+                with st.expander(f"⚠️ Audit encountered {len(report['errors'])} processing error(s)", expanded=True):
+                    for err in report["errors"]:
+                        st.markdown(f"- {err}")
             
             pdf_key = f"pdf_{filenames[i]}"
             if pdf_key not in st.session_state:
@@ -264,7 +360,10 @@ if st.session_state.reports:
             
             findings = report.get("findings", [])
             if not findings:
-                st.success("✅ No critical, high, or medium violations found in this document!")
+                if report.get("status") in ["error", "partial_error"]:
+                    st.info("⚠️ No violations could be determined because chunk processing failed. Please check the errors above.")
+                else:
+                    st.success("✅ No critical, high, or medium violations found in this document!")
             else:
                 critical_high = [f for f in findings if f.get("severity", "").lower() in ["critical", "high"]]
                 medium = [f for f in findings if f.get("severity", "").lower() == "medium"]
