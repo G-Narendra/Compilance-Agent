@@ -1,0 +1,32 @@
+# Environments
+.env
+.venv
+venv/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Vector DBs & Local Storage
+chroma_db/
+*.db
+*.sqlite3
+
+# Streamlit
+.streamlit/
+
+# Media / Data
+*.pdf
+*.txt
+*.md
+!README.md
+!AI_DEPLOYMENT_OPERATIONS_MASTER_GUIDE.md
+!AI_PRODUCTION_MASTER_GUIDE.md
+!requirements.txt
+
+# IDEs
+.vscode/
+.idea/
