@@ -26,6 +26,7 @@ chroma_db/
 !AI_DEPLOYMENT_OPERATIONS_MASTER_GUIDE.md
 !AI_PRODUCTION_MASTER_GUIDE.md
 !requirements.txt
+!runtime.txt
 
 # IDEs
 .vscode/
