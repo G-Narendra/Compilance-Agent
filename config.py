@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     nvidia_api_key: str = ""
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
     compliance_model: str = "microsoft/phi-3-mini-128k-instruct"
+    use_mock_llm: bool = False
 
     # vector db (qdrant in-memory)
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
