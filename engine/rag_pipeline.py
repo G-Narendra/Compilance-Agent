@@ -8,13 +8,67 @@ import streamlit as st
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from sentence_transformers import SentenceTransformer
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from rank_bm25 import BM25Okapi
 from config import get_settings
 from utils.logger import get_logger
 
 log = get_logger("rag_pipeline")
 settings = get_settings()
+
+
+def _semantic_chunk(text: str, target_size: int = 1000, max_size: int = 1500) -> list[str]:
+    """Split text by paragraph boundaries, merging small paragraphs.
+    
+    Regulatory documents have natural clause boundaries (double newlines).
+    Splitting at these boundaries preserves semantic integrity — a clause
+    about "non-compete duration" stays whole instead of being cut mid-sentence.
+    
+    Anti-pattern avoided: RecursiveCharacterTextSplitter cuts at arbitrary
+    character counts, destroying clause context and producing chunks that
+    start mid-sentence.
+    """
+    paragraphs = re.split(r'\n\s*\n', text)
+    chunks = []
+    current = ""
+    
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        
+        # If adding this paragraph exceeds max_size, flush current and start new
+        if current and len(current) + len(para) + 2 > max_size:
+            chunks.append(current)
+            current = para
+        elif current:
+            current += "\n\n" + para
+        else:
+            current = para
+        
+        # If current exceeds target_size, flush it
+        if len(current) >= target_size:
+            chunks.append(current)
+            current = ""
+    
+    if current.strip():
+        chunks.append(current)
+    
+    return chunks
+
+
+# Cross-encoder for re-ranking. Loaded lazily to avoid startup penalty.
+_reranker = None
+
+
+def _get_reranker():
+    global _reranker
+    if _reranker is None:
+        try:
+            from sentence_transformers import CrossEncoder
+            _reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        except Exception as e:
+            log.warning("Cross-encoder not available, skipping re-ranking", error=str(e))
+    return _reranker
 
 _qdrant_client = None
 
@@ -50,13 +104,6 @@ def ingest_rulebook(doc_id: str, parsed_data: dict) -> int:
         vectors_config=VectorParams(size=encoder.get_sentence_embedding_dimension(), distance=Distance.COSINE),
     )
     
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len,
-        is_separator_regex=False,
-    )
-
     points = []
     pages = parsed_data.get("pages", [])
     
@@ -67,7 +114,11 @@ def ingest_rulebook(doc_id: str, parsed_data: dict) -> int:
         page_num = page.get("page_num", 1)
         text = page.get("text", "")
         
-        chunks = text_splitter.split_text(text)
+        # Semantic chunking: split by paragraphs (natural boundaries in
+        # regulatory documents), then merge small paragraphs up to the
+        # target size. This preserves clause integrity instead of cutting
+        # mid-sentence like RecursiveCharacterTextSplitter does.
+        chunks = _semantic_chunk(text, target_size=1000, max_size=1500)
         for chunk in chunks:
             if chunk.strip():
                 all_chunks.append(chunk)
@@ -150,13 +201,25 @@ def retrieve_relevant_rules(rulebook_id: str, query: str, top_k: int = 5) -> lis
         chunk_text = payloads[idx]["text"]
         rrf_scores[chunk_text] = rrf_scores.get(chunk_text, 0.0) + 1.0 / (60.0 + rank)
         
-    # sort by final rrf score and pick top k
-    sorted_chunks = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)[:top_k]
+    # Sort by RRF score and take top candidates for re-ranking
+    sorted_candidates = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)[:top_k * 3]
     
-    # O(1) payload lookup keyed by chunk text — avoids linear scan over all chunks per result
+    # Cross-encoder re-ranking: rerank the top candidates by actual semantic
+    # relevance to the query. This catches cases where BM25 or vector search
+    # promote chunks that match keywords but don't actually answer the question.
+    reranker = _get_reranker()
+    if reranker and sorted_candidates:
+        pairs = [(query, chunk) for chunk in sorted_candidates]
+        scores = reranker.predict(pairs)
+        ranked = sorted(zip(sorted_candidates, scores), key=lambda x: x[1], reverse=True)
+        sorted_candidates = [chunk for chunk, score in ranked[:top_k]]
+    else:
+        sorted_candidates = sorted_candidates[:top_k]
+    
+    # O(1) payload lookup keyed by chunk text
     payload_by_text = {p["text"]: p for p in payloads}
     retrieved = []
-    for text in sorted_chunks:
+    for text in sorted_candidates:
         p = payload_by_text.get(text)
         if p is not None:
             retrieved.append({"text": p["text"], "page_num": p["page_num"]})
