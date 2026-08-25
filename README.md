@@ -72,7 +72,21 @@ To handle scanned paper contracts, digitally signed documents, and nested tables
 * **Exact Page Citations**: Every chunk is tagged with its original page number during the ingestion phase, passing metadata all the way to the LLM to guarantee correct citations.
 
 ### 3. Hybrid Search (RRF)
-* Combines **Dense Retrieval** (Qdrant semantic index using local `all-MiniLM-L6-v2` embeddings) with **Sparse Retrieval** (BM25 lexical search) using Reciprocal Rank Fusion (RRF). This guarantees the retrieval of exact keyword matches (e.g., "Article 16(2)") alongside semantic matches.
+* Combines **Dense Retrieval** (Qdrant semantic index using local `all-MiniLM-L6-v2` embeddings) with **Sparse Retrieval** (BM25 lexical search) using Reciprocal Rank Fusion (RRF). This guarantees the retrieval of exact keyword matches (e.g., "Article 16(2)") alongside semantic matches.---
+
+## 🧪 Engineering Decisions & Challenges Solved
+
+Real problems hit during development and how they were solved — this is the part of the story that never shows in a demo:
+
+| Challenge | What Went Wrong | Solution |
+|-----------|----------------|----------|
+| **Scanned PDFs returned empty text** | `pdfplumber` extracts text layers only — scanned/image-based regulatory PDFs came back blank, breaking the whole pipeline silently | Dual-strategy parser: `pdfplumber` first; if a page yields empty text, render at 300 DPI and fall back to Tesseract OCR. Page numbers tracked from ingestion → chunking → citation so every finding points to the exact page |
+| **Vector search missed exact legal references** | Pure semantic retrieval failed on precise citations like "Article 16(2)" — embeddings capture *meaning*, not exact strings | Hybrid retrieval: dense (Qdrant + MiniLM) fused with sparse (BM25Okapi) via Reciprocal Rank Fusion (k=60). Regex-based tokenization (`\w+`) so tokens like "16(2)" survive indexing instead of being mangled by naive whitespace splitting |
+| **LLM hallucinated findings** | An audit tool that invents violations is worse than no tool | Three defenses: grounded system prompt with explicit "NOT FOUND" instruction, forced exact-quote citations in the JSON schema, and `temperature=0` / `top_p=0.1` on all calls |
+| **One malformed LLM response killed the run** | Early versions crashed when the model wrapped JSON in markdown fences or added prose | Tiered JSON extraction: fenced block → raw fence → brace-span regex. Parse failure degrades to an error report instead of crashing the audit |
+| **Repeated audits re-billed identical API calls** | Compliance officers re-run audits after small edits, re-embedding unchanged rulebooks every time | SHA-256 content hashing at upload; unchanged documents skip parsing/embedding entirely and restore from cache |
+| **In-memory index lost on Streamlit rerun** | Streamlit's rerun model wipes module state mid-session, orphaning Qdrant collections from BM25 indexes | Auto-restore hook in `retrieve_relevant_rules`: detects a missing collection/index pair and re-ingests from cached parsed pages before failing |
+| **O(n) payload lookup after fusion** | RRF returns chunk texts; matching them back to payloads was a linear scan per result — O(n·k) on large rulebooks | Hash-map lookup keyed by chunk text → O(k). Also moved all imports to module level so failures surface at startup, not deep inside request handling |
 
 ---
 

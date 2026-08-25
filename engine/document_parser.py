@@ -8,6 +8,7 @@ engine/document_parser.py
 
 import os
 import io
+import tempfile
 from pathlib import Path
 from typing import List, Dict, Any
 import pdfplumber
@@ -85,7 +86,7 @@ def parse_document(file_path: str) -> dict:
         return {"pages": [], "metadata": metadata, "errors": [str(e)]}
 
 def parse_uploaded_content(content: bytes, filename: str) -> dict:
-    import tempfile
+    """Parse raw uploaded bytes by staging them in a temp file, then delegating to parse_document."""
     suffix = Path(filename).suffix or ".txt"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(content)

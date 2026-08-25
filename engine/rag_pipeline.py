@@ -2,6 +2,9 @@
 # using in-memory qdrant to dodge c++ build issues on windows
 
 import os
+import re
+
+import streamlit as st
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from sentence_transformers import SentenceTransformer
@@ -12,8 +15,6 @@ from utils.logger import get_logger
 
 log = get_logger("rag_pipeline")
 settings = get_settings()
-
-import streamlit as st
 
 _qdrant_client = None
 
@@ -84,10 +85,12 @@ def ingest_rulebook(doc_id: str, parsed_data: dict) -> int:
                 )
             )
             
-        # build sparse index for exact keyword matching
-        tokenized_corpus = [c.lower().split(" ") for c in all_chunks]
-        _bm25_indexes[doc_id] = BM25Okapi(tokenized_corpus)
-        _chunk_payloads[doc_id] = chunk_payloads
+    # build sparse index for exact keyword matching
+    # regex tokenizer: keeps alphanumerics (incl. digits in refs like "16(2)") instead of naive split()
+    tokenize = lambda text: re.findall(r"\w+", text.lower())
+    tokenized_corpus = [tokenize(c) for c in all_chunks]
+    _bm25_indexes[doc_id] = BM25Okapi(tokenized_corpus)
+    _chunk_payloads[doc_id] = chunk_payloads
             
     if points:
         batch_size = 500
@@ -128,7 +131,7 @@ def retrieve_relevant_rules(rulebook_id: str, query: str, top_k: int = 5) -> lis
     bm25 = _bm25_indexes[rulebook_id]
     payloads = _chunk_payloads[rulebook_id]
     
-    tokenized_query = query.lower().split(" ")
+    tokenized_query = tokenize(query)
     bm25_scores = bm25.get_scores(tokenized_query)
     
     # grab top k*2 to give rrf enough candidates to work with
@@ -150,15 +153,14 @@ def retrieve_relevant_rules(rulebook_id: str, query: str, top_k: int = 5) -> lis
     # sort by final rrf score and pick top k
     sorted_chunks = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)[:top_k]
     
+    # O(1) payload lookup keyed by chunk text — avoids linear scan over all chunks per result
+    payload_by_text = {p["text"]: p for p in payloads}
     retrieved = []
     for text in sorted_chunks:
-        # linear scan to grab original payload metadata
-        # fine for now, might need dict lookup if it gets huge
-        for p in payloads:
-            if p["text"] == text:
-                retrieved.append({"text": p["text"], "page_num": p["page_num"]})
-                break
-                
+        p = payload_by_text.get(text)
+        if p is not None:
+            retrieved.append({"text": p["text"], "page_num": p["page_num"]})
+            
     return retrieved
 
 def delete_rulebook(rulebook_id: str):

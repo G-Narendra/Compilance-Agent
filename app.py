@@ -1,5 +1,6 @@
 import streamlit as st
 import asyncio
+import hashlib
 import json
 import uuid
 from engine.document_parser import parse_uploaded_content
@@ -63,7 +64,6 @@ if submitted:
     if not rulebook_file or not target_files:
         st.error("Please upload BOTH a master rulebook and at least one target document.")
     else:
-        import hashlib
         with st.spinner("Parsing and vectorizing documents..."):
             # 1. process rulebook
             rule_content = rulebook_file.read()

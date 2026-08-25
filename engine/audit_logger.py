@@ -1,7 +1,7 @@
 import sqlite3
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from utils.logger import get_logger
 
 log = get_logger("audit_logger")
@@ -49,7 +49,7 @@ def log_telemetry(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trace_id,
-                datetime.utcnow().isoformat(),
+                datetime.now(timezone.utc).isoformat(),
                 target_document,
                 chunk_index,
                 tokens_used,
