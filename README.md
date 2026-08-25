@@ -1,6 +1,6 @@
 # 🛡️ Compliance Agent
 
-**Enterprise-Grade Agentic RAG + Parallel Map-Reduce Audit Pipeline + Zero-Hallucination Citations**
+**Local RAG pipeline for auditing documents against regulatory frameworks with exact citations.**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Framework Streamlit](https://img.shields.io/badge/frontend-Streamlit-red.svg)](https://streamlit.io/)
@@ -13,9 +13,11 @@
 
 ## 🎯 Problem Statement
 
-Manual compliance auditing for dense regulations (e.g., GDPR, HIPAA, SOC2) against massive enterprise documents is slow, error-prone, and financially risky. Standard Large Language Models (LLMs) hallucinate, omit critical violations, or fail when overwhelmed by context limitations.
+Manual compliance auditing for dense regulations (e.g., GDPR, HIPAA, SOC2) against massive enterprise documents is slow, error-prone, and financially risky. A single missed clause in a 200-page vendor contract can result in six-figure fines. Standard Large Language Models (LLMs) hallucinate, omit critical violations, or fail when overwhelmed by context limitations — GPT-4's 128K context window still can't hold an entire regulatory corpus alongside the target document.
 
-**Compliance Agent** solves this by implementing an autonomous, local **Retrieval-Augmented Generation (RAG)** pipeline combined with a **Map-Reduce Orchestrator**. The system parses documents, queries a local hybrid vector index, performs parallel audits, and generates structured reports with exact citations—ensuring 100% auditability with zero hallucinations.
+Existing compliance tools (OneTrust, BigID) focus on data mapping and consent management, not document-level clause extraction. Open-source RAG frameworks like LangChain provide building blocks but lack the Map-Reduce orchestration needed for parallel multi-document auditing. Pure semantic search misses exact legal references ("Article 16(2)") because embeddings capture meaning, not string matches.
+
+**Compliance Agent** solves this by implementing a local **Retrieval-Augmented Generation (RAG)** pipeline with hybrid search (semantic + BM25 keyword) fused via Reciprocal Rank Fusion, combined with a **Map-Reduce Orchestrator** that processes document sections in parallel. The system parses documents with OCR fallback for scanned PDFs, queries a local vector index, performs parallel audits across document chunks, and generates structured JSON reports with exact page-number citations — ensuring full traceability. After evaluating LangChain's default `RecursiveCharacterTextSplitter` against paragraph-boundary semantic chunking, I found that semantic chunking preserved clause integrity and improved retrieval precision by keeping related provisions together rather than splitting them at arbitrary character limits. The hybrid search approach (dense + sparse) was chosen over pure vector search after discovering that legal documents rely heavily on exact references that embeddings alone cannot match.
 
 ---
 
@@ -28,7 +30,7 @@ graph TD
     User([Compliance Officer]) --> UI[Streamlit Interface]
     UI --> |Upload Rulebook| Ingest[Document Ingestion & OCR Pipeline]
     
-    Ingest --> |Chunking| Split[Recursive Text Splitter]
+    Ingest --> |Chunking| Split[Semantic Chunker<br/>Paragraph Boundaries]
     Split --> |Dense Embeddings| Encoder[MiniLM-L6-v2<br/>Semantic Vectors]
     Split --> |Sparse Keywords| BM25[BM25Okapi<br/>Lexical Index]
     
@@ -41,42 +43,109 @@ graph TD
     Hybrid -.-> Qdrant
     Hybrid -.-> MemCache
     
-    Hybrid --> |Context + Chunk| LLM[NVIDIA NIMs API<br/>Phi-3 Mini 128k]
+    Hybrid --> |Context + Chunk| LLM[NVIDIA NIMs API<br/>Llama 3.1 8B]
     LLM --> |Generate JSON Findings| Agg[Deduplication & Merge Layer]
     Agg --> Report([Structured Audit Dashboard])
     Report --> |Lazy Generation| PDF[Custom PDF Report Generator]
 ```
 
----
+### Data Flow
 
-## 🚀 Key Architectural Features
-
-- **Progressive UI Journey**: Uses Streamlit forms and session states to enforce a clean step-by-step flow (Master Rulebook ingestion ➡️ Target Document upload ➡️ Parallel Audit execution).
-- **Parallel Map-Reduce Auditing**: Target documents are split, mapped to async threads running hybrid retrieval, evaluated against the rulebook, and then dynamically merged and deduplicated.
-- **State-Aware Audit Caching**: Utilizes advanced SHA-256 document hashing and session state to cache finalized audit reports. Re-running unchanged documents guarantees **zero-latency** execution and eliminates LLM non-determinism.
-- **Developer Traceability (SQLite)**: Silently logs token usage, latencies, exceptions, and raw LLM outputs to a local SQLite database (`telemetry.db`) with an interactive debugging panel in the UI.
-- **Premium Layout PDF Generator**: Generates clean, well-aligned PDF reports with colored left accent bars corresponding to finding severity (Critical, High, Medium, Info) and page-break sentinels to prevent orphaned headers.
+1. **Ingestion**: User uploads a master rulebook (PDF/TXT/MD) — parsed page-by-page with `pdfplumber`; scanned pages fall back to Tesseract OCR at 300 DPI
+2. **Indexing**: Text is split by paragraph boundaries (not character count), embedded with MiniLM-L6-v2, and stored in Qdrant (in-memory); a parallel BM25Okapi index is built for keyword matching
+3. **Retrieval**: For each chunk of the target document, hybrid search combines dense vector similarity and sparse BM25 scores via Reciprocal Rank Fusion (k=60), then re-ranks top candidates with a cross-encoder (`ms-marco-MiniLM-L-6-v2`)
+4. **Analysis**: NVIDIA NIMs API (Llama 3.1 8B, temp=0, top_p=0.1) generates structured JSON findings with exact rulebook citations and page numbers
+5. **Aggregation**: Findings are deduplicated across chunks, severity-ranked, and presented in a Streamlit dashboard with a downloadable PDF report
 
 ---
 
-## 🛠️ Technical Specifications
+## 🛠️ Tech Stack
 
-### 1. The OCR Pipeline
-To handle scanned paper contracts, digitally signed documents, and nested tables:
-* **Digital Extraction (`pdfplumber`)**: Used as the primary tool. Unlike generic parsers, `pdfplumber` extracts precise character coordinates, word boundaries, and nested table structures from digitally generated PDFs.
-* **OCR Fallback (`pytesseract`)**: If a page returns empty text (scanned PDF or images), the page is rendered as a `300 DPI` image and passed to Tesseract OCR.
-* **Why this stack?**: It guarantees privacy (100% local parsing), zero cost, and high layout-aware accuracy.
+| Component | Technology | Why |
+|---|---|---|
+| **Frontend** | Streamlit | Rapid prototyping with session state for multi-step workflows |
+| **LLM** | NVIDIA NIMs (Llama 3.1 8B Instruct) | Free tier, good instruction following, 128K context |
+| **Embeddings** | SentenceTransformers (all-MiniLM-L6-v2) | Fast, lightweight, 384-dim, works well for English legal text |
+| **Vector DB** | Qdrant (in-memory) | Avoids C++ build issues on Windows; sufficient for document-level auditing |
+| **Keyword Search** | BM25Okapi (rank_bm25) | Exact keyword matching for legal references like "Article 16(2)" |
+| **Re-ranking** | Cross-Encoder (ms-marco-MiniLM-L-6-v2) | Validates semantic relevance after RRF fusion |
+| **PDF Parsing** | pdfplumber + Tesseract OCR | Layout-aware extraction with fallback for scanned documents |
+| **PDF Generation** | ReportLab | Custom audit report generation |
+| **Config** | Pydantic Settings + dotenv | Type-safe configuration with env var support |
 
-### 2. RAG Chunking Strategy
-* **Recursive Character Splitting**: The rulebook is chunked using an overlap pattern (`chunk_size=1000`, `chunk_overlap=200`). This ensures that paragraphs are split at semantic boundaries (like double newlines or punctuation) rather than mid-sentence, preserving context.
-* **Exact Page Citations**: Every chunk is tagged with its original page number during the ingestion phase, passing metadata all the way to the LLM to guarantee correct citations.
+---
 
-### 3. Hybrid Search (RRF)
-* Combines **Dense Retrieval** (Qdrant semantic index using local `all-MiniLM-L6-v2` embeddings) with **Sparse Retrieval** (BM25 lexical search) using Reciprocal Rank Fusion (RRF). This guarantees the retrieval of exact keyword matches (e.g., "Article 16(2)") alongside semantic matches.---
+## 🔧 How It Works
+
+### Step 1: Upload & Ingest
+
+Upload a master rulebook (the regulations you're auditing against) and one or more target documents. The system:
+
+- Parses the rulebook page-by-page, tracking page numbers for citations
+- Falls back to OCR for scanned/image-based PDFs
+- Splits text by paragraph boundaries (preserving clause integrity)
+- Builds both a vector index (Qdrant) and a keyword index (BM25)
+
+### Step 2: Audit
+
+The system processes each chunk of the target document:
+
+1. Retrieves relevant rulebook excerpts via hybrid search (dense + sparse)
+2. Re-ranks results with a cross-encoder for precision
+3. Sends context + chunk to the LLM for compliance analysis
+4. Extracts structured JSON findings with exact citations
+
+### Step 3: Report
+
+Results are aggregated, deduplicated, and displayed in a dashboard with:
+- Compliance score (0-100)
+- Severity-ranked findings (critical/high/medium/low)
+- Exact rulebook citations with page numbers
+- Downloadable PDF report
+
+---
+
+## 📊 Key Features
+
+- **Hybrid Search**: Dense vector similarity + BM25 keyword matching via Reciprocal Rank Fusion
+- **Semantic Chunking**: Paragraph-boundary splitting preserves clause integrity (not arbitrary character cuts)
+- **Cross-Encoder Re-ranking**: Validates relevance after RRF fusion
+- **OCR Fallback**: Handles scanned/image-based PDFs via Tesseract
+- **Exact Citations**: Every finding includes the exact rulebook quote and page number
+- **Parallel Processing**: Async Map-Reduce for multi-document auditing
+- **Telemetry**: SQLite logging of every LLM call with token usage and latency
+- **Caching**: Content-hash based caching avoids re-embedding unchanged rulebooks
+
+---
+
+## ⚙️ Setup & Run
+
+### Prerequisites
+- Python 3.10 or 3.11
+- Tesseract OCR (installed locally and added to system PATH)
+
+### 1. Clone & Install Dependencies
+```bash
+git clone https://github.com/G-Narendra/Compilance-Agent.git
+cd Compilance-Agent
+pip install -r requirements.txt
+```
+
+### 2. Configure API Key
+```bash
+cp .env.example .env
+# Edit .env and add your NVIDIA API key
+# NVIDIA_API_KEY=nvapi-xxxxx
+```
+
+### 3. Launch the App
+```bash
+streamlit run app.py
+```
+
+---
 
 ## 🧪 Engineering Decisions & Challenges Solved
-
-Real problems hit during development and how they were solved — this is the part of the story that never shows in a demo:
 
 | Challenge | What Went Wrong | Solution |
 |-----------|----------------|----------|
@@ -92,70 +161,34 @@ Real problems hit during development and how they were solved — this is the pa
 
 ---
 
-## ⚙️ Setup & Run
-
-### Prerequisites
-- Python 3.10 or 3.11
-- Tesseract OCR (installed locally on host and added to system PATH)
-
-### 1. Clone & Install Dependencies
-```bash
-git clone https://github.com/G-Narendra/Compilance-Agent.git
-cd Compilance-Agent
-python -m venv venv
-# Windows:
-.\venv\Scripts\activate
-# Linux/Mac:
-source venv/bin/activate
-
-pip install -r requirements.txt
-```
-
-### 2. Configure Environment
-Copy `.env.example` to `.env` and fill in your details:
-```bash
-cp .env.example .env
-```
-Ensure you provide your **NVIDIA API Key** in `.env`:
-```env
-# NVIDIA NIMs API key
-NVIDIA_API_KEY=nvapi-your_nvidia_key_here
-
-# (Optional) Set to true to test the UI flow instantly without consuming an API key
-USE_MOCK_LLM=false
-```
-
-### 3. Launch Streamlit Application
-```bash
-streamlit run app.py
-```
-
----
-
-
-
 ## 📁 Project Structure
 
 ```
-Compliance-Agent/
-├── app.py                          # Streamlit UI, Form batching, tabbed report
-├── config.py                       # Global Settings & model configurations
-├── requirements.txt                # Project dependencies
+Compilance-Agent/
+├── app.py                          # Main Streamlit application
+├── config.py                       # Pydantic settings (env vars)
 ├── engine/
-│   ├── document_parser.py          # pdfplumber parsing + pytesseract OCR fallback
-│   ├── rag_pipeline.py             # Qdrant (in-memory) + BM25 hybrid search RRF
-│   └── pdf_generator.py            # Redesigned custom FPDF card-based generator
+│   ├── document_parser.py          # PDF/DOCX/TXT parsing with OCR fallback
+│   ├── rag_pipeline.py             # Qdrant + BM25 hybrid search with RRF
+│   ├── audit_logger.py             # SQLite telemetry logging
+│   └── pdf_generator.py            # Custom PDF report generation
 ├── services/
-│   └── llm_service.py              # NVIDIA NIM client, JSON recovery, token tracker
-└── utils/
-    ├── helpers.py                  # SHA hashing & text utilities
-    ├── logger.py                   # Custom structured logging
-    └── styles.py                   # Premium Custom CSS (Glassmorphism & animations)
+│   └── llm_service.py              # NVIDIA NIMs API wrapper with retry
+├── utils/
+│   ├── helpers.py                  # Text hashing, token estimation
+│   ├── logger.py                   # Structured logging
+│   └── styles.py                   # Custom CSS for Streamlit
+├── requirements.txt
+├── .env.example
+└── README.md
 ```
 
 ---
 
-## 🔐 Privacy & Security
+## ⚠️ Disclaimer
 
-1. **Local Vector Storage**: All vector conversions and database reads are performed 100% in-memory via local Qdrant instances. rulebooks and client documents are never stored or exposed.
-2. **In-Memory Lifecycle**: Sensitive vector representations are destroyed the moment you shut down the application or refresh the page.
+This system is for educational and research purposes only. It does not replace professional compliance auditing. Always consult qualified legal and compliance professionals for regulatory decisions.
+
+---
+
+*Built for the UAE AI Student Projects Portfolio — demonstrating production-grade RAG engineering with hybrid search and exact citation tracking.*
