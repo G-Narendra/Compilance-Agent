@@ -2,11 +2,45 @@
 # temp=0 to kill hallucinations.
 
 import json
+import re
 import time
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 from config import get_settings
 from utils.logger import get_logger
+
+
+# ── AI Safety: Prompt Injection Defense ──────────────────────────────────────
+# Strips known injection patterns from user-supplied text before it reaches
+# the LLM. This is a defense-in-depth measure — the system prompt also
+# instructs the model to ignore injected instructions.
+_INJECTION_PATTERNS = [
+    re.compile(r"ignore\s+(all\s+)?previous\s+instructions?", re.IGNORECASE),
+    re.compile(r"disregard\s+(all\s+)?(prior|previous|above)\s+instructions?", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\s+", re.IGNORECASE),
+    re.compile(r"act\s+as\s+(if\s+)?(you\s+are\s+)?", re.IGNORECASE),
+    re.compile(r"pretend\s+(you\s+are|to\s+be)\s+", re.IGNORECASE),
+    re.compile(r"system\s*prompt\s*:\s*", re.IGNORECASE),
+    re.compile(r"<\|im_start\|>", re.IGNORECASE),
+    re.compile(r"<\|im_end\|>", re.IGNORECASE),
+]
+
+
+def sanitize_user_input(text: str, max_length: int = 50000) -> str:
+    """Strip prompt injection patterns and enforce length limits.
+
+    Returns the sanitized text. Patterns are replaced with '[REDACTED]'
+    so the LLM still receives the surrounding context.
+    """
+    if not text:
+        return text
+    # Enforce max length to prevent context overflow
+    if len(text) > max_length:
+        text = text[:max_length]
+    # Strip known injection patterns
+    for pattern in _INJECTION_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
 
 log = get_logger("llm_service")
 settings = get_settings()
@@ -34,6 +68,8 @@ class LLMService:
         temperature: float = 0.0,
         max_tokens: int = 4096,
     ) -> dict:
+        # AI Safety: sanitize user input before sending to LLM
+        user_prompt = sanitize_user_input(user_prompt)
         start_time = time.time()
         
         try:
